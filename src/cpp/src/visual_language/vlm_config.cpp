@@ -24,6 +24,7 @@ VLMModelType to_vlm_model_type(const std::string& value) {
         {"qwen2_vl", VLMModelType::QWEN2_VL},
         {"qwen2_5_vl", VLMModelType::QWEN2_5_VL},
         {"gemma3", VLMModelType::GEMMA3},
+        {"mistral3", VLMModelType::MISTRAL3},
     };
 
     auto it = model_types_map.find(value);
@@ -69,6 +70,9 @@ VLMConfig::VLMConfig(const std::filesystem::path& json_path) {
     // Qwen2.5VL
     read_json_param(parsed, "vision_config.window_size", vision_config_window_size);
     read_json_param(parsed, "vision_config.tokens_per_second", vision_config_tokens_per_second);
+
+    // mistral3
+    read_json_param(parsed, "image_token_index", image_token_index);
 }
 
 } // namespace ov::genai

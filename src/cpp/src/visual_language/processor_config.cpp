@@ -41,4 +41,7 @@ ov::genai::ProcessorConfig::ProcessorConfig(const std::filesystem::path& json_pa
     // Setting gemma3-4b-it config params
     read_json_param(parsed, "size.height", size_height);
     read_json_param(parsed, "size.width", size_width);
+
+    // Setting mistral3 / pixtral config params
+    read_json_param(parsed, "size.longest_edge", size_longest_edge);
 }

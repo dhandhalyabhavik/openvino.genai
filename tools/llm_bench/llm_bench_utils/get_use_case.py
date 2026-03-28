@@ -57,6 +57,8 @@ def resolve_complex_model_types(config):
         return USE_CASES["visual_text_gen"][0], model_type
     if model_type == "llama4":
         return USE_CASES["visual_text_gen"][0], model_type
+    if model_type == "mistral3":
+        return USE_CASES["visual_text_gen"][0], model_type
     return None, None
 
 

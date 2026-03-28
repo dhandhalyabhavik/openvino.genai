@@ -21,6 +21,7 @@ enum class VLMModelType {
     QWEN2_VL,
     QWEN2_5_VL,
     GEMMA3,
+    MISTRAL3,
 };
 
 /// @brief A Configuration class passed to VLMPipeline and used to
@@ -93,6 +94,9 @@ public:
     std::string image_soft_token = "<image_soft_token>";
     /// @brief A string token denoting end of vision embeddings for gemma3-4b-it model.
     std::string end_of_image = "<end_of_image>";
+
+    /// @brief Image token index for mistral3 model (token ID used for image placeholders).
+    int64_t image_token_index = 10;
 
     /// @brief A string token denoting start of video embeddings 
     std::string video_start = "<video>";

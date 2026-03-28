@@ -50,6 +50,9 @@ public:
     size_t size_height = 896;
     size_t size_width = 896;
 
+    // mistral3 / pixtral specific config params
+    size_t size_longest_edge = 768;
+
     struct {
         size_t num_crops = 4;
         size_t num_img_tokens = 144;
