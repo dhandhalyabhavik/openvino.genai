@@ -262,6 +262,13 @@ def get_argparser():
         help="Path to draft model folder including IR files for Speculative decoding generation",
     )
     parser.add_argument(
+        "--speculative_decoding",
+        required=False,
+        default=None,
+        choices=["dflash"],
+        help="Speculative decoding method. Currently supports 'dflash' for DFlash speculative decoding.",
+    )
+    parser.add_argument(
         "--draft_device", required=False, default=None, help="Inference device for Speculative decoding of draft model"
     )
     parser.add_argument(

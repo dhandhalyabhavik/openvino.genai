@@ -117,6 +117,11 @@ def create_text_gen_model(model_path, device, memory_data_collector, **kwargs):
     if not model_path_existed:
         raise RuntimeError(f'==Failure ==: model path:{model_path} does not exist')
     else:
+        # Route to DFlash pipeline if speculative_decoding is set to 'dflash'
+        if kwargs.get('speculative_decoding') == 'dflash':
+            log.info("Selected DFlash speculative decoding pipeline")
+            return create_dflash_text_gen_model(model_path, device, ov_config, memory_data_collector, **kwargs)
+
         if kwargs.get("genai", True):
             if not is_genai_available(log_msg=True):
                 raise RuntimeError("OpenVINO GenAI based benchmarking is required, but not available.")
@@ -314,6 +319,296 @@ def create_genai_text_gen_model(model_path, device, ov_config, memory_data_colle
     streamer = TokenStreamer(llm_pipe.get_tokenizer()) if use_streamer_metrics else None
 
     return llm_pipe, None, end - start, streamer, True
+
+
+class DFlashLLMPipelineWrapper:
+    """DFlash speculative decoding pipeline for llm-bench.
+
+    Uses OpenVINO runtime directly with mask-based dead position handling.
+    Target and draft models run on user-specified devices.
+    No external dependencies beyond openvino, numpy, and transformers.
+    """
+
+    MAX_KV = 4096    # Max KV length (pre-allocate buffers; dynamically grown if exceeded)
+    MAX_HIDDEN = 1024  # Max hidden states to accumulate
+
+    def __init__(self, target_model_dir, draft_model_dir, device, draft_device=None, block_size=8):
+        import numpy as np
+        import openvino as ov
+
+        self.block_size = block_size
+        self.device = device
+        self.draft_device = draft_device or device
+
+        core = ov.Core()
+
+        # Load DFlash config from draft model directory
+        draft_path = Path(draft_model_dir)
+        with open(draft_path / "dflash_config.json") as f:
+            cfg = json.load(f)
+        self.mask_token_id = cfg["mask_token_id"]
+        self.hidden_size = cfg["hidden_size"]
+        self.vocab_size = cfg["vocab_size"]
+        n_layers = len(cfg.get("target_layer_ids", [1, 9, 17, 25, 33]))
+        self.hidden_dim = self.hidden_size * n_layers
+
+        # Compile target model (stateful, KV cache internal)
+        target_path = Path(target_model_dir)
+        log.info(f"[DFlash] Compiling target on {device}...")
+        tm = core.read_model(str(target_path / "openvino_model.xml"))
+        self.tc = core.compile_model(tm, device)
+        self.ti = self.tc.create_infer_request()
+
+        # Compile draft model with f32 precision to avoid NaN in FC/attention
+        log.info(f"[DFlash] Compiling draft on {self.draft_device} (f32)...")
+        dm = core.read_model(str(draft_path / "openvino_model.xml"))
+        self.dc = core.compile_model(dm, self.draft_device, {
+            ov.properties.hint.inference_precision: ov.Type.f32
+        })
+        self.di = self.dc.create_infer_request()
+
+        # Load tokenizer from target model directory
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(str(target_path))
+        # Normalize eos_token_id to a set (some tokenizers return a list)
+        eos = self.tokenizer.eos_token_id
+        self.eos_token_ids = set(eos) if isinstance(eos, list) else {eos}
+
+        # Pre-allocated reusable buffers
+        self._beam = ov.Tensor(np.array([0], dtype=np.int32))
+        self._block_ids = np.full((1, block_size), self.mask_token_id, dtype=np.int64)
+        self._verify_ids = np.zeros((1, block_size), dtype=np.int64)
+        self._attn_buf = np.ones((1, self.MAX_KV), dtype=np.int64)
+        self._hidden_buf = np.zeros((1, self.MAX_HIDDEN, self.hidden_dim), dtype=np.float32)
+        self._hidden_len = 0
+
+    def _prefill(self, all_ids):
+        """Run target model prefill on all input tokens."""
+        import numpy as np
+        import openvino as ov
+
+        self.ti.reset_state()
+        n = all_ids.shape[1]
+        self.ti.set_tensor("input_ids", ov.Tensor(all_ids))
+        self.ti.set_tensor("attention_mask", ov.Tensor(np.ones((1, n), dtype=np.int64)))
+        self.ti.set_tensor("position_ids", ov.Tensor(np.arange(n, dtype=np.int64).reshape(1, -1)))
+        self.ti.set_tensor("beam_idx", self._beam)
+        self.ti.infer()
+        logits = self.ti.get_tensor("logits").data
+        hidden = self.ti.get_tensor("last_hidden_state").data
+        return logits, hidden
+
+    def generate(self, prompt, max_new_tokens=256):
+        """Generate text using DFlash speculative decoding.
+
+        Returns dict with keys: text, num_input_tokens, num_output_tokens,
+        prefill_time, decode_time, total_time, tokens_per_second, avg_acceptance, etc.
+        """
+        import numpy as np
+        import openvino as ov
+        import time as _time
+
+        bs = self.block_size
+
+        # Tokenize with chat template
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        input_ids = self.tokenizer.encode(text, return_tensors="np").astype(np.int64)
+        num_input = input_ids.shape[1]
+
+        # === PREFILL ===
+        t_start = _time.perf_counter()
+        logits, hidden = self._prefill(input_ids)
+        first_token = int(np.argmax(logits[0, -1, :]))
+
+        # Initialize hidden buffer with prefill output
+        h_len = hidden.shape[1]
+        self._hidden_buf[0, :h_len, :] = hidden[0].astype(np.float32) if hidden.dtype != np.float32 else hidden[0]
+        self._hidden_len = h_len
+
+        # Initialize attention mask buffer
+        self._attn_buf[:] = 0
+        self._attn_buf[:, :num_input] = 1
+        attn_len = num_input
+
+        kv_len = num_input
+        next_pos = num_input
+        dead_count = 0
+        max_dead_ratio = 0.3  # Re-prefill when dead entries exceed 30% of KV length
+
+        t_prefill = _time.perf_counter() - t_start
+
+        generated = [first_token]
+        acc_lens = []
+        t_decode_start = _time.perf_counter()
+
+        while len(generated) < max_new_tokens:
+            if generated[-1] in self.eos_token_ids:
+                break
+
+            # === CHECK DEAD RATIO → RE-PREFILL ===
+            if dead_count > 0 and dead_count > max_dead_ratio * kv_len:
+                all_toks = np.concatenate(
+                    [input_ids, np.array([generated], dtype=np.int64)], axis=1)
+                logits, hidden = self._prefill(all_toks)
+                h_len = hidden.shape[1]
+                self._hidden_buf[0, :h_len, :] = hidden[0].astype(np.float32) if hidden.dtype != np.float32 else hidden[0]
+                self._hidden_len = h_len
+                kv_len = all_toks.shape[1]
+                next_pos = kv_len
+                self._attn_buf[:] = 0
+                self._attn_buf[:, :kv_len] = 1
+                attn_len = kv_len
+                dead_count = 0
+                continue
+
+            # === DRAFT ===
+            self._block_ids[0, :] = self.mask_token_id
+            self._block_ids[0, 0] = generated[-1]
+
+            # Context cap for draft hidden states
+            ctx_cap = 96
+            h_total = self._hidden_len
+            if h_total > ctx_cap:
+                start_idx = h_total - ctx_cap
+                draft_hidden = self._hidden_buf[:, start_idx:h_total, :]
+            else:
+                draft_hidden = self._hidden_buf[:, :h_total, :]
+                ctx_cap = h_total
+
+            pos_draft = np.arange(ctx_cap + bs, dtype=np.int64).reshape(1, -1)
+            self.di.set_tensor(self.dc.input(0), ov.Tensor(self._block_ids))
+            self.di.set_tensor(self.dc.input(1), ov.Tensor(draft_hidden))
+            self.di.set_tensor(self.dc.input(2), ov.Tensor(pos_draft))
+            self.di.infer()
+
+            draft_logits = self.di.get_tensor(self.dc.output(0)).data
+            draft_tokens = np.argmax(draft_logits[0, 1:, :], axis=-1)
+
+            # === VERIFY ===
+            self._verify_ids[0, 0] = generated[-1]
+            self._verify_ids[0, 1:] = draft_tokens
+
+            # Extend attention mask for new block (grow buffer if needed)
+            new_attn_len = attn_len + bs
+            if new_attn_len > self._attn_buf.shape[1]:
+                new_size = max(new_attn_len * 2, self._attn_buf.shape[1] * 2)
+                old_buf = self._attn_buf
+                self._attn_buf = np.zeros((1, new_size), dtype=np.int64)
+                self._attn_buf[:, :attn_len] = old_buf[:, :attn_len]
+            self._attn_buf[:, attn_len:new_attn_len] = 1
+
+            vpos = np.arange(next_pos, next_pos + bs, dtype=np.int64).reshape(1, -1)
+            self.ti.set_tensor("input_ids", ov.Tensor(self._verify_ids))
+            self.ti.set_tensor("attention_mask", ov.Tensor(self._attn_buf[:, :new_attn_len].copy()))
+            self.ti.set_tensor("position_ids", ov.Tensor(vpos))
+            self.ti.set_tensor("beam_idx", self._beam)
+            self.ti.infer()
+
+            kv_len += bs
+            next_pos += bs
+
+            v_logits = self.ti.get_tensor("logits").data
+            v_hidden = self.ti.get_tensor("last_hidden_state").data
+
+            # === ACCEPT/REJECT (greedy) ===
+            posterior = np.argmax(v_logits[0], axis=-1)
+            acc = 0
+            for i in range(bs - 1):
+                if draft_tokens[i] == posterior[i]:
+                    acc += 1
+                else:
+                    break
+            acc_lens.append(acc + 1)
+
+            new_tokens = list(draft_tokens[:acc]) + [int(posterior[acc])]
+            generated.extend(new_tokens)
+
+            # === UPDATE MASK — mark dead (rejected) positions ===
+            for i in range(bs):
+                if i <= acc:
+                    self._attn_buf[0, attn_len + i] = 1
+                else:
+                    self._attn_buf[0, attn_len + i] = 0
+                    dead_count += 1
+            attn_len = new_attn_len
+
+            # === UPDATE HIDDEN STATES ===
+            n_new = acc + 1
+            h_cur = self._hidden_len
+            if h_cur + n_new > self.MAX_HIDDEN:
+                keep = self.MAX_HIDDEN - n_new
+                self._hidden_buf[0, :keep, :] = self._hidden_buf[0, h_cur - keep:h_cur, :]
+                h_cur = keep
+            self._hidden_buf[0, h_cur:h_cur + n_new, :] = (
+                v_hidden[0, :n_new, :].astype(np.float32)
+                if v_hidden.dtype != np.float32 else v_hidden[0, :n_new, :]
+            )
+            self._hidden_len = h_cur + n_new
+
+        # === FINALIZE ===
+        t_decode = _time.perf_counter() - t_decode_start
+        t_total = _time.perf_counter() - t_start
+
+        generated = generated[:max_new_tokens]
+        # Stop at first EOS token
+        for eos_id in self.eos_token_ids:
+            if eos_id in generated:
+                generated = generated[:generated.index(eos_id)]
+                break
+
+        text_out = self.tokenizer.decode(generated, skip_special_tokens=True)
+        n = len(generated)
+        tps = n / t_decode if t_decode > 0 else 0
+        avg_acc = float(np.mean(acc_lens)) if acc_lens else 0
+
+        return {
+            "text": text_out,
+            "num_input_tokens": num_input,
+            "num_output_tokens": n,
+            "prefill_time": t_prefill,
+            "decode_time": t_decode,
+            "total_time": t_total,
+            "tokens_per_second": tps,
+            "avg_acceptance": avg_acc,
+            "acceptance_lengths": acc_lens,
+            "dead_entries": dead_count,
+        }
+
+
+def create_dflash_text_gen_model(model_path, device, ov_config, memory_data_collector, **kwargs):
+    """Create a DFlash speculative decoding pipeline for benchmarking."""
+    draft_model_path = kwargs.get('draft_model', '')
+    if not draft_model_path:
+        raise RuntimeError('DFlash speculative decoding requires --draft_model to be specified')
+    if not Path(draft_model_path).exists():
+        raise RuntimeError(f'Draft model path does not exist: {draft_model_path}')
+
+    draft_device = kwargs.get('draft_device', None) or device
+    block_size = kwargs.get('num_assistant_tokens', 8) or 8
+    log.info(f"DFlash config: target={model_path}, draft={draft_model_path}, "
+             f"device={device}, draft_device={draft_device}, block_size={block_size}")
+
+    if kwargs.get("mem_consumption"):
+        memory_data_collector.start()
+    start = time.perf_counter()
+    wrapper = DFlashLLMPipelineWrapper(
+        target_model_dir=model_path,
+        draft_model_dir=draft_model_path,
+        device=device.upper(),
+        draft_device=draft_device.upper(),
+        block_size=block_size,
+    )
+    end = time.perf_counter()
+    log.info(f'DFlash pipeline initialization time: {end - start:.2f}s')
+    if kwargs.get("mem_consumption"):
+        memory_data_collector.stop_and_collect_data("compilation")
+        memory_data_collector.log_data(compilation=True)
+
+    # Return: model, tokenizer, pretrain_time, bench_hook, use_genai
+    # use_genai='dflash' is a special marker to route to dflash generation function
+    return wrapper, wrapper.tokenizer, end - start, None, 'dflash'
 
 
 def convert_ov_tokenizer(tokenizer_path):

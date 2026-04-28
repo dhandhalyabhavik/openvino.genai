@@ -600,6 +600,121 @@ def run_text_generation_genai_with_stream(
     streamer.reset()
 
 
+def run_text_generation_dflash(
+    input_text,
+    num,
+    model,
+    tokenizer,
+    args,
+    iter_data_list,
+    md5_list,
+    prompt_index,
+    bench_hook,  # unused for dflash, but kept for consistent signature
+    tokens_len,
+    streaming,
+    model_precision,
+    proc_id,
+    mem_consumption,
+    prefix,
+):
+    """Run text generation using DFlash speculative decoding pipeline."""
+    if args["output_dir"] is not None and num == 0:
+        llm_bench_utils.output_file.output_input_text(input_text, args, model_precision, prompt_index, 0, proc_id)
+
+    mem_consumption.start(num)
+    max_gen_tokens = DEFAULT_OUTPUT_TOKEN_SIZE if args['infer_count'] is None else args['infer_count']
+
+    # Tokenize to count input tokens
+    tok_encode_start = time.perf_counter()
+    input_tokens = tokenizer.encode(input_text)
+    tok_encode_end = time.perf_counter()
+    tok_encode_time = (tok_encode_end - tok_encode_start) * 1000
+    num_input_tokens = len(input_tokens)
+
+    log.info("%s DFlash text generation start: %s", prefix, datetime.datetime.now().isoformat())
+    start = time.perf_counter()
+    result = model.generate(input_text, max_new_tokens=int(max_gen_tokens))
+    end = time.perf_counter()
+    log.info("%s DFlash text generation end: %s", prefix, datetime.datetime.now().isoformat())
+    generation_time = end - start
+    memory_metrics = mem_consumption.iter_stop_and_collect_data(num)
+
+    generated_text = result['text']
+    num_tokens = result['num_output_tokens']
+
+    # Decode timing (text already decoded by DFlash pipeline)
+    tok_decode_time = 0.0
+    tokenization_time = (tok_encode_time, tok_decode_time)
+
+    result_md5_list = [hashlib.new("md5", generated_text.encode(), usedforsecurity=False).hexdigest()]
+    if args["output_dir"] is not None:
+        llm_bench_utils.output_file.output_gen_text(generated_text, args, model_precision, prompt_index, num, 0, proc_id)
+
+    if len(md5_list[num]) == 0:
+        md5_list[num] = {prompt_index: result_md5_list}
+    else:
+        md5_list[num][prompt_index] = result_md5_list
+
+    per_token_time = ""
+    if num_tokens > 0:
+        per_token_time = generation_time * 1000 / num_tokens
+    else:
+        log.warning("No generated tokens")
+
+    # Build timing list from DFlash result.
+    # NOTE: DFlash generates tokens in blocks (block_size tokens per speculation round),
+    # so individual per-token latencies are not available. The timings below are synthetic
+    # approximations: first token = prefill time, remaining = average decode time per token.
+    # These are used for compatibility with the metrics printing infrastructure.
+    prefill_time_s = result.get('prefill_time', 0)
+    decode_time_s = result.get('decode_time', 0)
+    # Approximate per-token times: first token = prefill, rest = decode / (n-1)
+    tm_list = []
+    if num_tokens > 0:
+        tm_list.append(prefill_time_s)  # first token latency in seconds
+        if num_tokens > 1:
+            avg_decode_per_token = decode_time_s / (num_tokens - 1) if num_tokens > 1 else 0
+            tm_list.extend([avg_decode_per_token] * (num_tokens - 1))
+
+    # Log DFlash-specific metrics
+    avg_acceptance = result.get('avg_acceptance', 0)
+    tps = result.get('tokens_per_second', 0)
+    log.info(f"{prefix} DFlash: {num_tokens} tokens, {tps:.1f} tok/s, "
+             f"avg_acceptance={avg_acceptance:.2f}, prefill={prefill_time_s*1000:.1f}ms")
+
+    iter_data = gen_output_data.gen_iterate_data(
+        iter_idx=num,
+        in_size=num_input_tokens,
+        infer_count=num_tokens,
+        out_size=num_tokens,
+        gen_time=generation_time,
+        latency=per_token_time,
+        res_md5=result_md5_list,
+        prompt_idx=prompt_index,
+        tokenization_time=tokenization_time,
+        **memory_metrics,
+    )
+    iter_data_list.append(iter_data)
+    metrics_print.print_metrics(
+        num,
+        iter_data,
+        tm_list,
+        None,
+        warm_up=(num == 0),
+        tokenization_time=tokenization_time,
+        batch_size=1,
+        prompt_idx=prompt_index,
+    )
+    if num > 0:
+        prev_md5 = md5_list[num - 1][prompt_index]
+        if result_md5_list != prev_md5:
+            log.warning(f"[{num}] Prompt[{prompt_index}]'s md5 {result_md5_list} "
+                        f"is different from md5 of the {num - 1} iteration {prev_md5}")
+            metrics_print.print_generated(num, warm_up=(num == 0), generated=generated_text, prompt_idx=prompt_index)
+    else:
+        metrics_print.print_generated(num, warm_up=(num == 0), generated=generated_text, prompt_idx=prompt_index)
+
+
 def run_text_generation_benchmark(model_path, framework, device, tokens_len, streaming, args, num_iters, mem_consumption):
     mem_consumption.update_marker("model")
     model, tokenizer, pretrain_time, bench_hook, use_genai = FW_UTILS[framework].create_text_gen_model(model_path, device, mem_consumption, **args)
@@ -623,7 +738,9 @@ def run_text_generation_benchmark(model_path, framework, device, tokens_len, str
              f'prompt nums: {len(text_list)}, prompt idx: {prompt_idx_list}')
 
     # if num_iters == 0, just output warm-up data
-    if not use_genai:
+    if use_genai == 'dflash':
+        text_gen_fn = run_text_generation_dflash
+    elif not use_genai:
         text_gen_fn = run_text_generation
     elif bench_hook is not None:
         text_gen_fn = run_text_generation_genai_with_stream
