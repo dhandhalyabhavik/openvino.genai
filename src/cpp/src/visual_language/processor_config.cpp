@@ -31,6 +31,9 @@ ov::genai::ProcessorConfig::ProcessorConfig(const nlohmann::json& parsed) {
     // Setting phi3_v config params
     read_json_param(parsed, "img_processor.num_img_tokens", phi3_v.num_img_tokens);
 
+    // Setting Pixtral/Mistral3 config params
+    read_json_param(parsed, "size.longest_edge", size_longest_edge);
+
     // Setting qwen2vl config params
     read_json_param(parsed, "min_pixels", min_pixels);
     read_json_param(parsed, "max_pixels", max_pixels);

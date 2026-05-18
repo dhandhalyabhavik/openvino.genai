@@ -62,6 +62,9 @@ public:
         size_t num_crops = 4;
         size_t num_img_tokens = 144;
     } phi3_v;
+    // Pixtral/Mistral3 specific params
+    size_t size_longest_edge = 1540;
+
     // qwen2vl specific params
     size_t min_pixels = 3136;
     size_t max_pixels = 12845056;

@@ -27,6 +27,7 @@ enum class VLMModelType {
     GEMMA3,
     GEMMA4,
     VIDEOCHAT_FLASH_QWEN,
+    MISTRAL3,
 };
 
 /// @brief A Configuration class passed to VLMPipeline and used to
@@ -122,6 +123,18 @@ public:
     size_t vision_config_num_position_embeddings = 2304;
     /// @brief DeepStack visual indexes for Qwen3-VL model.
     std::vector<size_t> vision_config_deepstack_visual_indexes;
+
+    // Mistral3 / Pixtral-specific config
+    /// @brief Placeholder token for image embeddings in Mistral3/Pixtral prompts.
+    std::string mistral3_image_token = "[IMG]";
+    /// @brief Row separator token used by PixtralProcessor after image-token expansion.
+    std::string mistral3_image_break_token = "[IMG_BREAK]";
+    /// @brief End-of-image token used by PixtralProcessor after image-token expansion.
+    std::string mistral3_image_end_token = "[IMG_END]";
+    /// @brief Token id of image_token in the tokenizer vocabulary.
+    int64_t mistral3_image_token_index = 10;
+    /// @brief Pixtral spatial merge size used to determine prompt image-token grid.
+    size_t spatial_merge_size = 2;
 
     /// @brief Default constructor.
     VLMConfig() = default;
